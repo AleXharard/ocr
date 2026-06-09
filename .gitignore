@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.keyauto.pid
+logs/
+.cursor/
+_analyze*.py
+_head_ocr.py
+*.log
