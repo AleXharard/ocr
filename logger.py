@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
-DEBUG_DIR = LOG_DIR / "debug"
+_MAX_LOG_FILES = 10  # păstrăm doar ultimele N loguri de sesiune; restul se șterg
 
 _ui_sink: "LogPanel | None" = None
 _file_logger: logging.Logger | None = None
@@ -18,10 +18,19 @@ _lock = threading.Lock()
 _session_file: Path | None = None
 
 
+def _prune_old_logs(keep: int = _MAX_LOG_FILES) -> None:
+    """Șterge logurile vechi, păstrând doar cele mai recente `keep` fișiere."""
+    try:
+        logs = sorted(LOG_DIR.glob("keyauto_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in logs[keep:]:
+            old.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def init() -> Path:
     global _file_logger, _session_file
     LOG_DIR.mkdir(exist_ok=True)
-    DEBUG_DIR.mkdir(exist_ok=True)
 
     _session_file = LOG_DIR / f"keyauto_{datetime.now():%Y%m%d_%H%M%S}.log"
     _file_logger = logging.getLogger("keyauto")
@@ -37,6 +46,7 @@ def init() -> Path:
     )
     _file_logger.addHandler(fh)
 
+    _prune_old_logs()
     info(f"Sesiune nouă · log: {_session_file.name}")
     return _session_file
 
@@ -83,20 +93,6 @@ def warn(msg: str) -> None:
 
 def error(msg: str, exc: BaseException | None = None) -> None:
     _emit("ERROR", msg, exc)
-
-
-def save_debug_image(img, name: str) -> Path | None:
-    """Salvează frame pentru debug (numpy BGR)."""
-    try:
-        import cv2
-
-        path = DEBUG_DIR / f"{name}_{datetime.now():%H%M%S_%f}.png"
-        cv2.imwrite(str(path), img)
-        debug(f"Screenshot debug salvat: {path.name}")
-        return path
-    except Exception as e:
-        warn(f"Nu am putut salva screenshot debug: {e}")
-        return None
 
 
 class LogPanel:

@@ -2,6 +2,8 @@
 Key Auto — detectează casetele albe și apasă tastele în ordine.
 """
 
+from __future__ import annotations
+
 import threading
 import time
 import tkinter as tk
@@ -37,7 +39,7 @@ CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 SELECTED_REGION: dict | None = None
 PID_FILE = Path(__file__).resolve().parent / ".keyauto.pid"
 
-_sct: mss.MSS | None = None
+_sct: "mss.base.MSSBase | None" = None
 _dxcam = None
 _ocr = None
 
@@ -89,10 +91,10 @@ def _init_capture():
         log.warn(f"DXGI indisponibil, folosesc MSS — {e}")
 
 
-def _get_sct() -> mss.MSS:
+def _get_sct() -> "mss.base.MSSBase":
     global _sct
     if _sct is None:
-        _sct = mss.MSS()
+        _sct = mss.mss()
     return _sct
 
 
@@ -247,7 +249,6 @@ def scan_and_press(status_cb=None, key_delay_ms: int | None = None, prepare_cb=N
 
     if len(boxes) < MIN_BOXES:
         log.warn(f"Prea puține casete: {len(boxes)} (min {MIN_BOXES})")
-        log.save_debug_image(frame, "few_boxes")
         return False, f"Casete: {len(boxes)} (min {MIN_BOXES})"
 
     focus_ok = [False]
@@ -265,7 +266,6 @@ def scan_and_press(status_cb=None, key_delay_ms: int | None = None, prepare_cb=N
         partial = " ".join(chars) if chars else "(niciuna)"
         log.warn(f"OCR incomplet: {len(chars)}/{len(boxes)} · mod {ocr_mode}")
         log.warn(f"Detectat parțial: {partial}")
-        log.save_debug_image(frame, "ocr_fail")
         return False, f"Citite: {len(chars)}/{len(boxes)}"
 
     sequence = normalize_sequence("".join(chars))
@@ -609,6 +609,11 @@ class App(ctk.CTk):
         if _dxcam is not None:
             try:
                 _dxcam.release()
+            except Exception:
+                pass
+        if _sct is not None:
+            try:
+                _sct.close()
             except Exception:
                 pass
         self.destroy()
