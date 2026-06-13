@@ -96,97 +96,145 @@ def error(msg: str, exc: BaseException | None = None) -> None:
 
 
 class LogPanel:
-    """Panou scrollabil în UI."""
+    """Panou de log scrollabil, cu culori pe nivel și filtru debug."""
 
-    COLORS = {
-        "DEBUG": "#666666",
-        "INFO": "#aaaaaa",
-        "WARNING": "#d4a017",
-        "ERROR": "#e05555",
+    # nivel -> (badge, culoare badge, culoare mesaj)
+    LEVELS = {
+        "DEBUG": ("DBG", "#5b6370", "#7a828f"),
+        "INFO": ("INF", "#5aa9e6", "#cdd3de"),
+        "WARNING": ("WRN", "#e5b567", "#e5b567"),
+        "ERROR": ("ERR", "#e06c6c", "#f08a8a"),
     }
+    TS_COLOR = "#474d5a"
+    MAX_LINES = 400
 
-    def __init__(self, parent, height: int = 140):
+    def __init__(self, parent, height: int = 180):
         import customtkinter as ctk
 
-        self._frame = ctk.CTkFrame(parent, fg_color="#0d0d0d")
-        self._frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self._buffer: list[tuple[str, str, str]] = []  # (level, ts, msg)
+        self._show_debug = ctk.BooleanVar(value=False)
+        self._collapsed = False
+        self._height = height
+
+        self._frame = ctk.CTkFrame(parent, fg_color="#101014", corner_radius=12)
+        self._frame.pack(fill="both", expand=True, padx=16, pady=(4, 6))
 
         header = ctk.CTkFrame(self._frame, fg_color="transparent")
-        header.pack(fill="x", padx=6, pady=(6, 2))
+        header.pack(fill="x", padx=12, pady=(10, 4))
 
-        ctk.CTkLabel(header, text="Log", font=ctk.CTkFont(size=11, weight="bold"), text_color="#666").pack(
-            side="left"
+        self._collapse_btn = ctk.CTkButton(
+            header, text="▾ LOG", width=58, height=24, font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="transparent", hover_color="#222630", text_color="#6b7280",
+            command=self.toggle_collapse,
         )
+        self._collapse_btn.pack(side="left")
 
-        ctk.CTkButton(
-            header,
-            text="Clear",
-            width=50,
-            height=22,
-            font=ctk.CTkFont(size=10),
-            fg_color="#222",
-            hover_color="#333",
-            command=self.clear,
-        ).pack(side="right", padx=(4, 0))
+        self._debug_switch = ctk.CTkSwitch(
+            header, text="Debug", variable=self._show_debug, command=self._rerender,
+            font=ctk.CTkFont(size=11), switch_width=34, switch_height=16, text_color="#6b7280",
+        )
+        self._debug_switch.pack(side="left", padx=(12, 0))
 
-        ctk.CTkButton(
-            header,
-            text="Folder",
-            width=50,
-            height=22,
-            font=ctk.CTkFont(size=10),
-            fg_color="#222",
-            hover_color="#333",
-            command=self._open_folder,
-        ).pack(side="right")
+        btn_kw = dict(width=52, height=24, font=ctk.CTkFont(size=11),
+                      fg_color="#222630", hover_color="#2e333f")
+        ctk.CTkButton(header, text="Clear", command=self.clear, **btn_kw).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(header, text="Folder", command=self._open_folder, **btn_kw).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(header, text="Copy", command=self.copy_log, **btn_kw).pack(side="right")
 
         self._text = ctk.CTkTextbox(
             self._frame,
             height=height,
-            font=ctk.CTkFont(family="Consolas", size=10),
-            fg_color="#111111",
-            text_color="#aaaaaa",
+            font=ctk.CTkFont(family="Cascadia Mono", size=11),
+            fg_color="#0a0a0d",
             activate_scrollbars=True,
+            wrap="word",
         )
-        self._text.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self._text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        self._text.tag_config("ts", foreground=self.TS_COLOR)
+        for level, (_badge, badge_color, msg_color) in self.LEVELS.items():
+            self._text.tag_config(f"badge_{level}", foreground=badge_color)
+            self._text.tag_config(f"msg_{level}", foreground=msg_color)
+
         self._text.configure(state="disabled")
 
-        self._lines = 0
-        self._max_lines = 300
+    def _insert(self, level: str, ts: str, msg: str) -> None:
+        badge, _, _ = self.LEVELS.get(level, ("·", "#888", "#aaa"))
+        self._text.insert("end", f"{ts}  ", "ts")
+        self._text.insert("end", f"{badge}  ", f"badge_{level}")
+        self._text.insert("end", f"{msg}\n", f"msg_{level}")
 
     def append(self, level: str, msg: str) -> None:
-        color = self.COLORS.get(level, "#aaaaaa")
         ts = datetime.now().strftime("%H:%M:%S")
-        line = f"[{ts}] {msg}\n"
+        self._buffer.append((level, ts, msg))
+        if len(self._buffer) > self.MAX_LINES:
+            self._buffer.pop(0)
+
+        if level == "DEBUG" and not self._show_debug.get():
+            return
 
         def _write():
             self._text.configure(state="normal")
-            self._text.insert("end", line)
+            self._insert(level, ts, msg)
+            # păstrăm panoul mărginit ca să rămână fluid
+            line_count = int(self._text.index("end-1c").split(".")[0])
+            if line_count > self.MAX_LINES:
+                self._text.delete("1.0", "2.0")
             self._text.configure(state="disabled")
             self._text.see("end")
-            self._lines += 1
-            if self._lines > self._max_lines:
-                self._text.configure(state="normal")
-                self._text.delete("1.0", "2.0")
-                self._text.configure(state="disabled")
-                self._lines -= 1
 
-        # thread-safe UI update
         try:
             self._text.after(0, _write)
         except Exception:
             pass
 
+    def _rerender(self) -> None:
+        show_debug = self._show_debug.get()
+        self._text.configure(state="normal")
+        self._text.delete("1.0", "end")
+        for level, ts, msg in self._buffer:
+            if level == "DEBUG" and not show_debug:
+                continue
+            self._insert(level, ts, msg)
+        self._text.configure(state="disabled")
+        self._text.see("end")
+
     def clear(self) -> None:
+        self._buffer.clear()
         self._text.configure(state="normal")
         self._text.delete("1.0", "end")
         self._text.configure(state="disabled")
-        self._lines = 0
-        info("Log UI golit")
+        info("Log golit")
+
+    def copy_log(self) -> None:
+        """Copiază în clipboard liniile vizibile (respectând filtrul Debug)."""
+        show_debug = self._show_debug.get()
+        lines = [
+            f"{ts} {self.LEVELS.get(level, ('·',))[0]} {msg}"
+            for level, ts, msg in self._buffer
+            if show_debug or level != "DEBUG"
+        ]
+        try:
+            self._frame.clipboard_clear()
+            self._frame.clipboard_append("\n".join(lines))
+            info(f"Log copiat ({len(lines)} linii)")
+        except Exception as e:
+            warn(f"Nu pot copia logul: {e}")
+
+    def toggle_collapse(self) -> None:
+        """Ascunde/afișează panoul de text al logului (păstrând antetul)."""
+        if self._collapsed:
+            self._text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+            self._frame.pack_configure(expand=True, fill="both")
+            self._collapse_btn.configure(text="▾ LOG")
+        else:
+            self._text.pack_forget()
+            self._frame.pack_configure(expand=False, fill="x")
+            self._collapse_btn.configure(text="▸ LOG")
+        self._collapsed = not self._collapsed
 
     def _open_folder(self) -> None:
         import os
-        import subprocess
 
         LOG_DIR.mkdir(exist_ok=True)
         os.startfile(str(LOG_DIR))

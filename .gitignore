@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 .keyauto.pid
 logs/
+debug_busteni/
+regions.json
 .cursor/
 _analyze*.py
 _head_ocr.py

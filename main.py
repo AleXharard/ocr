@@ -4,6 +4,7 @@ Key Auto — detectează casetele albe și apasă tastele în ordine.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 import tkinter as tk
@@ -17,6 +18,7 @@ import mss
 import numpy as np
 from PIL import Image, ImageTk
 
+import busteni
 import game_input
 import logger as log
 import vision as vis
@@ -34,10 +36,40 @@ KEY_DELAY_MS = 25
 KEY_HOLD_MS = 20
 PRE_PRESS_MS = 35
 SCAN_INTERVAL_SEC = 0.06
+BUSTENI_SCAN_SEC = 0.012  # buclă rapidă pentru sincronizarea Busteni (~80fps)
 CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 SELECTED_REGION: dict | None = None
 PID_FILE = Path(__file__).resolve().parent / ".keyauto.pid"
+DEBUG_DIR = Path(__file__).resolve().parent / "debug_busteni"
+REGION_FILE = Path(__file__).resolve().parent / "regions.json"
+
+# Zone salvate, una per minijoc (Chei / Busteni au regiuni diferite pe ecran).
+# Persistăm și ultimul mod folosit, ca să pornim direct pe tab-ul potrivit.
+_REGIONS: dict[str, dict] = {}
+
+
+def _load_config() -> tuple[dict[str, dict], str | None]:
+    """Întoarce (zone_per_mod, ultimul_mod)."""
+    try:
+        if REGION_FILE.exists():
+            data = json.loads(REGION_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                regions = {k: v for k, v in data.items() if isinstance(v, dict)}
+                mode = data.get("__mode__")
+                return regions, (mode if mode in ("Chei", "Busteni") else None)
+    except Exception as e:
+        log.warn(f"Nu pot citi zonele salvate: {e}")
+    return {}, None
+
+
+def _save_config(mode: str) -> None:
+    try:
+        data: dict = dict(_REGIONS)
+        data["__mode__"] = mode
+        REGION_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.warn(f"Nu pot salva configul: {e}")
 
 _sct: "mss.base.MSSBase | None" = None
 _dxcam = None
@@ -425,17 +457,34 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Key Auto")
-        self.geometry("340x420")
-        self.minsize(340, 420)
+        self.geometry("380x540")
+        self.minsize(360, 500)
         self.resizable(True, True)
 
         self._running = False
         self._auto = False
+        self._mode = "Chei"  # "Chei" (casete albe) sau "Busteni" (sincronizare)
         self._lock = threading.Lock()
 
+        global _REGIONS, SELECTED_REGION
+        _REGIONS, last_mode = _load_config()
+        if last_mode:
+            self._mode = last_mode  # pornim pe ultimul tab folosit
+        SELECTED_REGION = _REGIONS.get(self._mode)
+
         self._build_ui()
+        # sincronizăm tab-ul + layout-ul cu modul salvat
+        self._mode_seg.set(self._mode)
+        self._apply_mode_ui(self._mode)
+
         log.attach_ui(self._log_panel)
         log.info(f"App pornită · {_ocr_label()} · {'DXGI' if _dxcam else 'MSS'}")
+        if SELECTED_REGION:
+            r = SELECTED_REGION
+            log.info(f"Zonă încărcată [{self._mode}]: {r['width']}x{r['height']} @ ({r['left']}, {r['top']})")
+        else:
+            log.info(f"Mod {self._mode} — selectează o zonă")
+        self._show_ready()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -448,45 +497,85 @@ class App(ctk.CTk):
             log.warn(f"Hotkey F6 indisponibil: {e}")
 
     def _build_ui(self):
-        top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x")
+        self.configure(fg_color="#070709")
 
-        ctk.CTkLabel(top, text="Key Auto", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(14, 2))
+        # ── Antet ──────────────────────────────────────────────
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=18, pady=(16, 2))
 
-        cap = "DXGI" if _dxcam else "MSS"
+        ctk.CTkLabel(
+            header, text="Key Auto", font=ctk.CTkFont(size=19, weight="bold")
+        ).pack(anchor="w")
+
         self._status = ctk.CTkLabel(
-            top, text=f"● Gata · {_ocr_label()} · {cap}", text_color="#888888", font=ctk.CTkFont(size=12)
+            header, text=self._ready_text(), text_color="#6b7280", font=ctk.CTkFont(size=12)
         )
-        self._status.pack(pady=(0, 10))
+        self._status.pack(anchor="w", pady=(1, 0))
 
-        row = ctk.CTkFrame(top, fg_color="transparent")
-        row.pack()
-        self._btn = ctk.CTkButton(row, text="Start", width=90, command=self._toggle)
-        self._btn.pack(side="left", padx=4)
-        ctk.CTkButton(row, text="Zonă", width=70, fg_color="#2a2a2a", hover_color="#333333", command=self._pick_region).pack(
-            side="left", padx=4
+        # ── Card comenzi ──────────────────────────────────────
+        card = ctk.CTkFrame(self, fg_color="#121217", corner_radius=12)
+        card.pack(fill="x", padx=16, pady=(12, 4))
+
+        self._mode_seg = ctk.CTkSegmentedButton(
+            card, values=["Chei", "Busteni"], command=self._on_mode_change,
+            font=ctk.CTkFont(size=13)
         )
+        self._mode_seg.set("Chei")
+        self._mode_seg.pack(fill="x", padx=14, pady=(14, 10))
+
+        self._btn = ctk.CTkButton(
+            card, text="Start", height=42,
+            font=ctk.CTkFont(size=15, weight="bold"), command=self._toggle
+        )
+        self._btn.pack(fill="x", padx=14, pady=(0, 10))
+
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=(0, 6))
 
         self._auto_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(top, text="Auto", variable=self._auto_var, command=self._on_auto_toggle).pack(pady=(10, 0))
+        self._auto_switch = ctk.CTkSwitch(
+            row, text="Auto-scan", variable=self._auto_var,
+            command=self._on_auto_toggle, font=ctk.CTkFont(size=13)
+        )
+        self._auto_switch.pack(side="left")
 
-        delay_row = ctk.CTkFrame(top, fg_color="transparent")
-        delay_row.pack(pady=(8, 0))
-        ctk.CTkLabel(delay_row, text="Delay", text_color="#666666", font=ctk.CTkFont(size=11)).pack(side="left")
+        self._busteni_debug = ctk.BooleanVar(value=False)  # implicit OFF — fără capturi
+        self._dbg_switch = ctk.CTkSwitch(
+            row, text="Capturi debug", variable=self._busteni_debug,
+            font=ctk.CTkFont(size=13)
+        )  # afișat doar în modul Busteni (vezi _on_mode_change); pornește-l doar la nevoie
+
+        ctk.CTkButton(
+            row, text="Select zonă", width=104, height=30,
+            font=ctk.CTkFont(size=12), fg_color="#24242c", hover_color="#30303a",
+            command=self._pick_region,
+        ).pack(side="right")
+
+        delay_row = ctk.CTkFrame(card, fg_color="transparent")
+        delay_row.pack(fill="x", padx=14, pady=(8, 14))
+        ctk.CTkLabel(
+            delay_row, text="Delay", text_color="#6b7280", font=ctk.CTkFont(size=12)
+        ).pack(side="left")
+        self._delay_label = ctk.CTkLabel(
+            delay_row, text=f"{KEY_DELAY_MS} ms", text_color="#9aa0aa",
+            font=ctk.CTkFont(size=12), width=52, anchor="e"
+        )
+        self._delay_label.pack(side="right")
         self._delay_slider = ctk.CTkSlider(
-            delay_row, from_=30, to=90, number_of_steps=12, width=120, command=self._on_delay_change
+            delay_row, from_=30, to=90, number_of_steps=12, command=self._on_delay_change
         )
         self._delay_slider.set(KEY_DELAY_MS)
-        self._delay_slider.pack(side="left", padx=(8, 4))
-        self._delay_label = ctk.CTkLabel(
-            delay_row, text=f"{KEY_DELAY_MS} ms", text_color="#888888", font=ctk.CTkFont(size=11), width=48
-        )
-        self._delay_label.pack(side="left")
+        self._delay_slider.pack(side="left", fill="x", expand=True, padx=(12, 12))
         self._key_delay_ms = KEY_DELAY_MS
 
-        ctk.CTkLabel(top, text="F6 = scan (din joc)", text_color="#555555", font=ctk.CTkFont(size=11)).pack(pady=(6, 0))
+        # ── Log ────────────────────────────────────────────────
+        self._log_panel = log.LogPanel(self, height=190)
 
-        self._log_panel = log.LogPanel(self, height=160)
+        self._hint = ctk.CTkLabel(
+            self, text="Apasă  F6  în joc pentru a scana",
+            text_color="#44464d", font=ctk.CTkFont(size=11)
+        )
+        self._hint.pack(pady=(0, 10))
 
     def _on_delay_change(self, value: float):
         self._key_delay_ms = int(value)
@@ -494,11 +583,23 @@ class App(ctk.CTk):
         log.debug(f"Delay taste: {self._key_delay_ms}ms")
 
     def _ready_text(self) -> str:
+        if not SELECTED_REGION:
+            return "● Selectează o zonă pentru a începe"
         cap = "DXGI" if _dxcam else "MSS"
         return f"● Gata · {_ocr_label()} · {cap}"
 
     def _set_status(self, text: str, color: str = "#888888"):
         self.after(0, lambda: self._status.configure(text=text, text_color=color))
+
+    def _show_ready(self):
+        """Stare clară de disponibilitate pentru F6."""
+        if not SELECTED_REGION:
+            self._set_status("● Selectează o zonă", "#e5b567")
+        elif self._mode == "Busteni":
+            self._set_status("● GATA — apasă F6 în joc", "#46d369")
+        else:
+            cap = "DXGI" if _dxcam else "MSS"
+            self._set_status(f"● GATA — F6 · {_ocr_label()} · {cap}", "#46d369")
 
     def _pick_region(self):
         was_auto = self._auto
@@ -512,7 +613,10 @@ class App(ctk.CTk):
             global SELECTED_REGION
             if region:
                 SELECTED_REGION = region
-                self._set_status("● Zonă actualizată", "#6b6")
+                _REGIONS[self._mode] = region
+                _save_config(self._mode)  # rămâne salvată între porniri, per minijoc
+                log.info(f"Zonă salvată [{self._mode}]")
+                self._set_status("● Zonă salvată", "#6b6")
             else:
                 self._set_status("● Zonă neschimbată", "#888888")
             self.deiconify()
@@ -524,13 +628,45 @@ class App(ctk.CTk):
 
         pick_region(self, on_done)
 
+    def _apply_mode_ui(self, mode: str):
+        """Aranjează widget-urile pentru modul dat (fără efecte secundare)."""
+        if mode == "Busteni":
+            self._auto_switch.pack_forget()  # Busteni nu buclează — o sesiune per F6
+            self._dbg_switch.pack(side="left")
+            self._btn.configure(text="Arm (F6)")
+            self._hint.configure(text="Intră în checkpoint, apasă  F6  — se oprește singur")
+        else:
+            self._dbg_switch.pack_forget()
+            self._auto_switch.pack(side="left")
+            self._btn.configure(text="Start")
+            self._hint.configure(text="Apasă  F6  în joc pentru a scana")
+
+    def _on_mode_change(self, mode: str):
+        if self._auto:  # oprim auto-scanul (specific Chei) la schimbarea modului
+            self._auto_var.set(False)
+            self._on_auto_toggle()
+        self._mode = mode
+        global SELECTED_REGION
+        SELECTED_REGION = _REGIONS.get(mode)  # fiecare minijoc are zona lui salvată
+        self._apply_mode_ui(mode)
+        self._show_ready()
+        _save_config(mode)  # reținem ultimul tab folosit
+        log.info(f"Mod minijoc: {mode}")
+
     def _hotkey_trigger(self):
         game_input.capture_target_window()
         log.debug("F6 apăsat")
-        if not self._running:
+        if self._running:
+            return
+        if self._mode == "Busteni":
+            self.after(0, self._run_busteni)
+        else:
             self.after(0, self._run_once)
 
     def _toggle(self):
+        if self._mode == "Busteni":
+            self._run_busteni()
+            return
         if self._auto_var.get():
             self._on_auto_toggle()
             return
@@ -558,6 +694,123 @@ class App(ctk.CTk):
             log.debug("Scan ignorat: deja în curs")
             return
         threading.Thread(target=self._execute, daemon=True).start()
+
+    # ── Busteni: o sesiune auto-oprită per F6 ───────────────────────────────
+    def _run_busteni(self):
+        if not SELECTED_REGION:
+            log.warn("Busteni blocat: nicio zonă selectată")
+            self._set_status("● Selectează o zonă", "#c88")
+            return
+        if self._running:
+            log.debug("Busteni ignorat: deja în curs")
+            return
+        threading.Thread(target=self._busteni_loop, daemon=True).start()
+
+    def _busteni_loop(self):
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+
+        log.info("── Busteni: sesiune armată (F6) ──")
+        self._set_status("● SCANEZ (Busteni)…", "#5aa9e6")
+        game_input.set_hold_ms(KEY_HOLD_MS)
+
+        # Aducem jocul în față (asta lasă fereastra noastră în spate); NU minimizăm și
+        # NU readucem fereastra — o lăsăm exact unde e, ca să nu deranjăm jocul.
+        game_input.focus_game(fast=True)
+
+        # dxcam NU e sigur în afara firului care l-a creat (crash nativ); în bucla
+        # Busteni folosim o instanță mss proprie firului, creată și închisă aici.
+        sct = mss.mss()
+        region = SELECTED_REGION
+        log.info(f"Busteni: captură MSS {region['width']}x{region['height']} @ {BUSTENI_SCAN_SEC*1000:.0f}ms")
+
+        debug_on = self._busteni_debug.get()
+        dbg_dir = saved = None
+        if debug_on:
+            from datetime import datetime
+            DEBUG_DIR.mkdir(exist_ok=True)
+            dbg_dir = DEBUG_DIR / f"sess_{datetime.now():%H%M%S}"
+            dbg_dir.mkdir(exist_ok=True)
+            saved = 0
+            log.info(f"Busteni: capturi debug în {dbg_dir.name}")
+
+        DBG_MAX = 120          # plafon imagini per sesiune
+        DBG_EVERY = 0.25       # cadență salvare cât timp e teal pe ecran
+        last_save = 0.0
+        teal_announced = False
+
+        def _save(tag, frame, st, digit=None, fired=False):
+            nonlocal saved
+            if not debug_on or saved is None or saved >= DBG_MAX:
+                return
+            # la FIRE salvăm și cadrul BRUT (neadnotat) ca să putem verifica citirea cifrei
+            if fired:
+                cv2.imwrite(str(dbg_dir / f"{saved:03d}_{tag}_raw.png"), frame)
+            # afișăm zona CACHUITĂ (cea folosită la declanșare), nu măsurarea ocluzată
+            disp = dict(st)
+            if session.zone_center is not None:
+                disp["zone_center"] = session.zone_center
+                disp["zone_half"] = session.zone_half
+            img = busteni.annotate(frame, disp, digit, fired)
+            cv2.imwrite(str(dbg_dir / f"{saved:03d}_{tag}.png"), img)
+            saved += 1
+
+        session = busteni.BustenSession()
+        session.start(time.perf_counter())
+        reason = "cap"
+        frames = 0
+        try:
+            while True:
+                now = time.perf_counter()
+                reason = session.should_stop(now)
+                if reason:
+                    break
+                shot = sct.grab(region)
+                frame = cv2.cvtColor(np.array(shot), cv2.COLOR_BGRA2BGR)
+                frames += 1
+                action = session.process(frame, now)
+                st = session.last_state
+
+                if debug_on and frames == 1:
+                    _save("first", frame, st, session.cur_digit)  # ce vede regiunea
+                if st.get("has_teal") and not teal_announced:
+                    teal_announced = True
+                    log.info(f"Busteni: minijoc detectat (z={st['n_zone']} i={st['n_ind']}) cifră={session.cur_digit}")
+                    _save("teal", frame, st, session.cur_digit)
+                if debug_on and st.get("has_teal") and now - last_save >= DBG_EVERY:
+                    last_save = now
+                    _save("scan", frame, st, session.cur_digit)
+
+                if action and action[0] == "press":
+                    digit = action[1]
+                    _save("FIRE", frame, st, digit, fired=True)
+                    ok = game_input.press_key(digit)
+                    import math as _m
+                    zc = session.zone_center
+                    ia = st.get("ind_angle")
+                    ang = (f" [zonă {_m.degrees(zc):.0f}° · ind {_m.degrees(ia):.0f}°]"
+                           if zc is not None and ia is not None else "")
+                    log.info(f"Busteni: {digit} (runda {session.pressed_count}){ang}"
+                             + ("" if ok else " — eșuat"))
+                    self._set_status(f"● Busteni: {digit}", "#6b6")
+                time.sleep(BUSTENI_SCAN_SEC)
+
+            extra = f" · {saved} capturi" if debug_on else ""
+            log.info(f"── Busteni stop [{reason}] · {session.pressed_count} apăsări · {frames} cadre{extra} ──")
+            # NU readucem fereastra în față — rămânem în joc. Statusul se actualizează
+            # oricum, iar F6 pornește o nouă sesiune fără fereastră.
+            self._show_ready()  # din nou GATA — se poate apăsa F6 pentru o nouă sesiune
+        except Exception as exc:
+            log.error(f"Eroare Busteni: {exc}", exc)
+            self._set_status(f"● Eroare: {exc}", "#c66")
+        finally:
+            try:
+                sct.close()
+            except Exception:
+                pass
+            self._running = False
 
     def _execute(self):
         with self._lock:
@@ -624,22 +877,6 @@ if __name__ == "__main__":
     game_input.init()
     _init_capture()
     _init_ocr()
-
-    boot = tk.Tk()
-    boot.withdraw()
-
-    def on_startup(region: dict | None):
-        global SELECTED_REGION
-        SELECTED_REGION = region
-        boot.quit()
-
-    pick_region(boot, on_startup)
-    boot.mainloop()
-    boot.destroy()
-
-    if not SELECTED_REGION:
-        log.warn("Pornire anulată — nicio zonă selectată")
-        raise SystemExit
 
     _save_pid()
     try:
