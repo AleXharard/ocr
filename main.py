@@ -21,7 +21,9 @@ from PIL import Image, ImageTk
 import busteni
 import game_input
 import logger as log
+import mina
 import vision as vis
+from app_paths import app_dir
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -33,40 +35,55 @@ MIN_AREA = 400
 MAX_AREA = 8000
 ASPECT_MIN, ASPECT_MAX = 0.6, 1.6
 KEY_DELAY_MS = 25
+KEY_DELAY_MIN = 0
+KEY_DELAY_MAX = 200
+KEY_DELAY_MAX_ENTRY = 500
 KEY_HOLD_MS = 20
 PRE_PRESS_MS = 35
 SCAN_INTERVAL_SEC = 0.06
 BUSTENI_SCAN_SEC = 0.012  # buclă rapidă pentru sincronizarea Busteni (~80fps)
+MINA_SCAN_SEC = 0.002       # pauză minimă când nu e piatră / așteptăm re-arm
 CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 SELECTED_REGION: dict | None = None
-PID_FILE = Path(__file__).resolve().parent / ".keyauto.pid"
-DEBUG_DIR = Path(__file__).resolve().parent / "debug_busteni"
-REGION_FILE = Path(__file__).resolve().parent / "regions.json"
+_APP_DIR = app_dir()
+PID_FILE = _APP_DIR / ".keyauto.pid"
+DEBUG_DIR = _APP_DIR / "debug_busteni"
+MINA_DEBUG_DIR = _APP_DIR / "debug_mina"
+REGION_FILE = _APP_DIR / "regions.json"
 
 # Zone salvate, una per minijoc (Chei / Busteni au regiuni diferite pe ecran).
 # Persistăm și ultimul mod folosit, ca să pornim direct pe tab-ul potrivit.
 _REGIONS: dict[str, dict] = {}
 
 
-def _load_config() -> tuple[dict[str, dict], str | None]:
-    """Întoarce (zone_per_mod, ultimul_mod)."""
+def _load_config() -> tuple[dict[str, dict], str | None, int]:
+    """Întoarce (zone_per_mod, ultimul_mod, delay_taste_ms)."""
     try:
         if REGION_FILE.exists():
             data = json.loads(REGION_FILE.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 regions = {k: v for k, v in data.items() if isinstance(v, dict)}
                 mode = data.get("__mode__")
-                return regions, (mode if mode in ("Chei", "Busteni") else None)
+                raw_delay = data.get("__key_delay_ms__", KEY_DELAY_MS)
+                delay = int(raw_delay) if isinstance(raw_delay, (int, float)) else KEY_DELAY_MS
+                delay = max(KEY_DELAY_MIN, min(KEY_DELAY_MAX_ENTRY, delay))
+                return regions, (mode if mode in ("Chei", "Busteni", "Mina") else None), delay
     except Exception as e:
         log.warn(f"Nu pot citi zonele salvate: {e}")
-    return {}, None
+    return {}, None, KEY_DELAY_MS
 
 
-def _save_config(mode: str) -> None:
+def _save_config(mode: str, *, key_delay_ms: int | None = None) -> None:
     try:
         data: dict = dict(_REGIONS)
         data["__mode__"] = mode
+        if key_delay_ms is not None:
+            data["__key_delay_ms__"] = key_delay_ms
+        elif REGION_FILE.exists():
+            prev = json.loads(REGION_FILE.read_text(encoding="utf-8"))
+            if isinstance(prev, dict) and "__key_delay_ms__" in prev:
+                data["__key_delay_ms__"] = prev["__key_delay_ms__"]
         REGION_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except Exception as e:
         log.warn(f"Nu pot salva configul: {e}")
@@ -111,6 +128,9 @@ def _clear_pid() -> None:
 
 
 # ── Captură ecran (dxcam → fallback mss) ───────────────────────────────────
+CAPTURE_RETRIES = 6
+CAPTURE_RETRY_DELAY_SEC = 0.045
+HOTKEY_CAPTURE_SETTLE_MS = 40  # minigame-ul are nevoie de un cadru după F6
 def _init_capture():
     global _dxcam
     try:
@@ -130,6 +150,23 @@ def _get_sct() -> "mss.base.MSSBase":
     return _sct
 
 
+def _reset_sct() -> None:
+    global _sct
+    if _sct is not None:
+        try:
+            _sct.close()
+        except Exception:
+            pass
+    _sct = None
+
+
+def _is_capture_error(exc: BaseException) -> bool:
+    if type(exc).__name__ == "ScreenShotError":
+        return True
+    msg = str(exc).lower()
+    return "bitblt" in msg or "screenshot" in msg or "capture" in msg
+
+
 def grab_screen() -> tuple[np.ndarray, str]:
     if not SELECTED_REGION:
         raise RuntimeError("Nicio zonă selectată")
@@ -137,20 +174,34 @@ def grab_screen() -> tuple[np.ndarray, str]:
     r = SELECTED_REGION
     left, top = r["left"], r["top"]
     right, bottom = left + r["width"], top + r["height"]
-    t0 = time.perf_counter()
+    region_dxcam = (left, top, right, bottom)
+    last_err: Exception | None = None
 
-    if _dxcam is not None:
-        frame = _dxcam.grab(region=(left, top, right, bottom))
-        if frame is not None:
+    for attempt in range(CAPTURE_RETRIES):
+        t0 = time.perf_counter()
+        try:
+            if _dxcam is not None:
+                frame = _dxcam.grab(region=region_dxcam)
+                if frame is not None:
+                    ms = (time.perf_counter() - t0) * 1000
+                    tag = f" (încercarea {attempt + 1})" if attempt else ""
+                    log.debug(f"Captură DXGI {frame.shape[1]}x{frame.shape[0]} · {ms:.1f}ms{tag}")
+                    return frame, "DXGI"
+
+            shot = _get_sct().grab(r)
+            frame = cv2.cvtColor(np.array(shot), cv2.COLOR_BGRA2BGR)
             ms = (time.perf_counter() - t0) * 1000
-            log.debug(f"Captură DXGI {frame.shape[1]}x{frame.shape[0]} · {ms:.1f}ms")
-            return frame, "DXGI"
+            tag = f" (încercarea {attempt + 1})" if attempt else ""
+            log.debug(f"Captură MSS {frame.shape[1]}x{frame.shape[0]} · {ms:.1f}ms{tag}")
+            return frame, "MSS"
+        except Exception as e:
+            last_err = e
+            _reset_sct()
+            if attempt < CAPTURE_RETRIES - 1:
+                log.debug(f"Captură eșuată ({attempt + 1}/{CAPTURE_RETRIES}): {e}")
+                time.sleep(CAPTURE_RETRY_DELAY_SEC)
 
-    shot = _get_sct().grab(r)
-    frame = cv2.cvtColor(np.array(shot), cv2.COLOR_BGRA2BGR)
-    ms = (time.perf_counter() - t0) * 1000
-    log.debug(f"Captură MSS {frame.shape[1]}x{frame.shape[0]} · {ms:.1f}ms")
-    return frame, "MSS"
+    raise last_err if last_err else RuntimeError("Captură eșuată")
 
 
 def capture_monitor() -> tuple[Image.Image, dict]:
@@ -272,9 +323,18 @@ def _press_key(ch: str) -> bool:
     return game_input.press_key(ch)
 
 
-def scan_and_press(status_cb=None, key_delay_ms: int | None = None, prepare_cb=None) -> tuple[bool, str]:
+def scan_and_press(
+    status_cb=None,
+    key_delay_ms: int | None = None,
+    prepare_cb=None,
+    *,
+    settle_ms: int = 0,
+) -> tuple[bool, str]:
     t_total = time.perf_counter()
     log.info("── Scan start ──")
+
+    if settle_ms > 0:
+        time.sleep(settle_ms / 1000)
 
     frame, capture_mode = grab_screen()
     boxes = detect_white_boxes(frame)
@@ -463,25 +523,30 @@ class App(ctk.CTk):
 
         self._running = False
         self._auto = False
-        self._mode = "Chei"  # "Chei" (casete albe) sau "Busteni" (sincronizare)
+        self._mina_active = False
+        self._mode = "Chei"  # "Chei" | "Busteni" | "Mina"
         self._lock = threading.Lock()
 
         global _REGIONS, SELECTED_REGION
-        _REGIONS, last_mode = _load_config()
+        _REGIONS, last_mode, saved_delay = _load_config()
         if last_mode:
             self._mode = last_mode  # pornim pe ultimul tab folosit
         SELECTED_REGION = _REGIONS.get(self._mode)
+        self._key_delay_ms = saved_delay
 
         self._build_ui()
+        self._set_key_delay_ms(saved_delay, save=False)
         # sincronizăm tab-ul + layout-ul cu modul salvat
         self._mode_seg.set(self._mode)
         self._apply_mode_ui(self._mode)
 
         log.attach_ui(self._log_panel)
-        log.info(f"App pornită · {_ocr_label()} · {'DXGI' if _dxcam else 'MSS'}")
+        log.info(f"App pornită · {_ocr_label()} · {'DXGI' if _dxcam else 'MSS'} · delay {self._key_delay_ms}ms")
         if SELECTED_REGION:
             r = SELECTED_REGION
             log.info(f"Zonă încărcată [{self._mode}]: {r['width']}x{r['height']} @ ({r['left']}, {r['top']})")
+        elif self._mode == "Mina":
+            log.info("Mod Mina — ecran complet · Start sau F6")
         else:
             log.info(f"Mod {self._mode} — selectează o zonă")
         self._show_ready()
@@ -517,7 +582,7 @@ class App(ctk.CTk):
         card.pack(fill="x", padx=16, pady=(12, 4))
 
         self._mode_seg = ctk.CTkSegmentedButton(
-            card, values=["Chei", "Busteni"], command=self._on_mode_change,
+            card, values=["Chei", "Busteni", "Mina"], command=self._on_mode_change,
             font=ctk.CTkFont(size=13)
         )
         self._mode_seg.set("Chei")
@@ -545,28 +610,41 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=13)
         )  # afișat doar în modul Busteni (vezi _on_mode_change); pornește-l doar la nevoie
 
+        self._mina_captures = ctk.BooleanVar(value=True)
+        self._mina_cap_switch = ctk.CTkSwitch(
+            row, text="Capturi detectare", variable=self._mina_captures,
+            font=ctk.CTkFont(size=13)
+        )
+
         ctk.CTkButton(
             row, text="Select zonă", width=104, height=30,
             font=ctk.CTkFont(size=12), fg_color="#24242c", hover_color="#30303a",
             command=self._pick_region,
         ).pack(side="right")
 
-        delay_row = ctk.CTkFrame(card, fg_color="transparent")
-        delay_row.pack(fill="x", padx=14, pady=(8, 14))
+        self._delay_row = ctk.CTkFrame(card, fg_color="transparent")
+        self._delay_row.pack(fill="x", padx=14, pady=(8, 14))
         ctk.CTkLabel(
-            delay_row, text="Delay", text_color="#6b7280", font=ctk.CTkFont(size=12)
+            self._delay_row, text="Delay taste", text_color="#6b7280", font=ctk.CTkFont(size=12)
         ).pack(side="left")
-        self._delay_label = ctk.CTkLabel(
-            delay_row, text=f"{KEY_DELAY_MS} ms", text_color="#9aa0aa",
-            font=ctk.CTkFont(size=12), width=52, anchor="e"
+        self._delay_entry = ctk.CTkEntry(
+            self._delay_row, width=52, height=28, justify="center",
+            font=ctk.CTkFont(size=12), fg_color="#141418", border_color="#30303a",
         )
-        self._delay_label.pack(side="right")
+        self._delay_entry.pack(side="right")
+        self._delay_entry_editing: int | None = None
+        self._delay_entry.bind("<FocusIn>", self._on_delay_entry_focus_in)
+        self._delay_entry.bind("<Return>", self._on_delay_entry_commit)
+        self._delay_entry.bind("<Escape>", self._on_delay_entry_cancel)
+        self._delay_entry.bind("<FocusOut>", self._on_delay_entry_focus_out)
         self._delay_slider = ctk.CTkSlider(
-            delay_row, from_=30, to=90, number_of_steps=12, command=self._on_delay_change
+            self._delay_row,
+            from_=KEY_DELAY_MIN,
+            to=KEY_DELAY_MAX,
+            number_of_steps=KEY_DELAY_MAX - KEY_DELAY_MIN,
+            command=self._on_delay_slider,
         )
-        self._delay_slider.set(KEY_DELAY_MS)
-        self._delay_slider.pack(side="left", fill="x", expand=True, padx=(12, 12))
-        self._key_delay_ms = KEY_DELAY_MS
+        self._delay_slider.pack(side="left", fill="x", expand=True, padx=(12, 10))
 
         # ── Log ────────────────────────────────────────────────
         self._log_panel = log.LogPanel(self, height=190)
@@ -577,12 +655,56 @@ class App(ctk.CTk):
         )
         self._hint.pack(pady=(0, 10))
 
-    def _on_delay_change(self, value: float):
-        self._key_delay_ms = int(value)
-        self._delay_label.configure(text=f"{self._key_delay_ms} ms")
-        log.debug(f"Delay taste: {self._key_delay_ms}ms")
+    def _set_key_delay_ms(self, ms: int, *, save: bool = True, update_entry: bool = True) -> None:
+        ms = max(KEY_DELAY_MIN, min(KEY_DELAY_MAX_ENTRY, int(ms)))
+        self._key_delay_ms = ms
+        self._delay_slider.set(min(KEY_DELAY_MAX, ms))
+        if update_entry:
+            self._delay_entry.delete(0, "end")
+            self._delay_entry.insert(0, str(ms))
+        if save:
+            _save_config(self._mode, key_delay_ms=ms)
+        log.debug(f"Delay taste: {ms}ms")
+
+    def _on_delay_slider(self, value: float) -> None:
+        self._set_key_delay_ms(int(round(value)))
+
+    def _on_delay_entry_focus_in(self, _event=None) -> None:
+        self._delay_entry_editing = self._key_delay_ms
+
+    def _on_delay_entry_commit(self, _event=None) -> str:
+        raw = self._delay_entry.get().strip().lower().replace("ms", "")
+        try:
+            self._set_key_delay_ms(int(raw))
+        except ValueError:
+            self._set_key_delay_ms(self._key_delay_ms, save=False)
+        self._delay_entry_editing = None
+        return "break"
+
+    def _on_delay_entry_cancel(self, _event=None) -> str:
+        if self._delay_entry_editing is not None:
+            self._set_key_delay_ms(self._delay_entry_editing, save=False)
+        self._delay_entry_editing = None
+        self.focus()
+        return "break"
+
+    def _on_delay_entry_focus_out(self, _event=None) -> None:
+        if self._delay_entry_editing is None:
+            return
+        raw = self._delay_entry.get().strip().lower().replace("ms", "")
+        if not raw:
+            self._set_key_delay_ms(self._delay_entry_editing, save=False)
+        else:
+            try:
+                self._set_key_delay_ms(int(raw))
+            except ValueError:
+                self._set_key_delay_ms(self._delay_entry_editing, save=False)
+        self._delay_entry_editing = None
 
     def _ready_text(self) -> str:
+        if self._mode == "Mina":
+            cap = "DXGI" if _dxcam else "MSS"
+            return f"● Gata · Mina · {cap} · ecran complet"
         if not SELECTED_REGION:
             return "● Selectează o zonă pentru a începe"
         cap = "DXGI" if _dxcam else "MSS"
@@ -593,7 +715,12 @@ class App(ctk.CTk):
 
     def _show_ready(self):
         """Stare clară de disponibilitate pentru F6."""
-        if not SELECTED_REGION:
+        if self._mode == "Mina":
+            if self._mina_active:
+                self._set_status("● MINA activă — scanez piatra", "#5aa9e6")
+            else:
+                self._set_status("● GATA — Start sau F6 în joc", "#46d369")
+        elif not SELECTED_REGION:
             self._set_status("● Selectează o zonă", "#e5b567")
         elif self._mode == "Busteni":
             self._set_status("● GATA — apasă F6 în joc", "#46d369")
@@ -630,12 +757,23 @@ class App(ctk.CTk):
 
     def _apply_mode_ui(self, mode: str):
         """Aranjează widget-urile pentru modul dat (fără efecte secundare)."""
-        if mode == "Busteni":
+        if mode == "Mina":
+            self._auto_switch.pack_forget()
+            self._dbg_switch.pack_forget()
+            self._mina_cap_switch.pack(side="left", padx=(12, 0))
+            self._delay_row.pack_forget()
+            self._btn.configure(text="Start")
+            self._hint.configure(text="Start / F6 — click automat · capturi în debug_mina/")
+        elif mode == "Busteni":
+            self._mina_cap_switch.pack_forget()
+            self._delay_row.pack(fill="x", padx=14, pady=(8, 14))
             self._auto_switch.pack_forget()  # Busteni nu buclează — o sesiune per F6
             self._dbg_switch.pack(side="left")
             self._btn.configure(text="Arm (F6)")
-            self._hint.configure(text="Intră în checkpoint, apasă  F6  — se oprește singur")
+            self._hint.configure(text="F6 în joc · delay = pauză după fiecare cifră apăsată")
         else:
+            self._mina_cap_switch.pack_forget()
+            self._delay_row.pack(fill="x", padx=14, pady=(8, 14))
             self._dbg_switch.pack_forget()
             self._auto_switch.pack(side="left")
             self._btn.configure(text="Start")
@@ -645,6 +783,8 @@ class App(ctk.CTk):
         if self._auto:  # oprim auto-scanul (specific Chei) la schimbarea modului
             self._auto_var.set(False)
             self._on_auto_toggle()
+        if self._mina_active:
+            self._stop_mina()
         self._mode = mode
         global SELECTED_REGION
         SELECTED_REGION = _REGIONS.get(mode)  # fiecare minijoc are zona lui salvată
@@ -656,14 +796,19 @@ class App(ctk.CTk):
     def _hotkey_trigger(self):
         game_input.capture_target_window()
         log.debug("F6 apăsat")
-        if self._running:
+        if self._running and self._mode != "Mina":
             return
         if self._mode == "Busteni":
             self.after(0, self._run_busteni)
+        elif self._mode == "Mina":
+            self.after(0, self._toggle_mina)
         else:
-            self.after(0, self._run_once)
+            self.after(0, lambda: self._run_once(from_hotkey=True))
 
     def _toggle(self):
+        if self._mode == "Mina":
+            self._toggle_mina()
+            return
         if self._mode == "Busteni":
             self._run_busteni()
             return
@@ -685,7 +830,7 @@ class App(ctk.CTk):
             self._set_status(self._ready_text())
             log.info("Mod Auto: OFF")
 
-    def _run_once(self):
+    def _run_once(self, *, from_hotkey: bool = False):
         if not SELECTED_REGION:
             log.warn("Scan blocat: nicio zonă selectată")
             self._set_status("● Selectează o zonă", "#c88")
@@ -693,7 +838,7 @@ class App(ctk.CTk):
         if self._running:
             log.debug("Scan ignorat: deja în curs")
             return
-        threading.Thread(target=self._execute, daemon=True).start()
+        threading.Thread(target=self._execute, args=(from_hotkey,), daemon=True).start()
 
     # ── Busteni: o sesiune auto-oprită per F6 ───────────────────────────────
     def _run_busteni(self):
@@ -792,9 +937,11 @@ class App(ctk.CTk):
                     ia = st.get("ind_angle")
                     ang = (f" [zonă {_m.degrees(zc):.0f}° · ind {_m.degrees(ia):.0f}°]"
                            if zc is not None and ia is not None else "")
-                    log.info(f"Busteni: {digit} (runda {session.pressed_count}){ang}"
+                    log.info(f"Busteni: {digit} (runda {session.pressed_count}, locked={session._digit_locked}){ang}"
                              + ("" if ok else " — eșuat"))
                     self._set_status(f"● Busteni: {digit}", "#6b6")
+                    if self._key_delay_ms > 0:
+                        time.sleep(self._key_delay_ms / 1000)
                 time.sleep(BUSTENI_SCAN_SEC)
 
             extra = f" · {saved} capturi" if debug_on else ""
@@ -812,45 +959,227 @@ class App(ctk.CTk):
                 pass
             self._running = False
 
-    def _execute(self):
+    def _stop_mina(self, *, completed: bool = False, clicks: int = 0) -> None:
+        self._mina_active = False
+        self._btn.configure(
+            text="Start",
+            fg_color=["#3B8ED0", "#1F6AA5"],
+            hover_color=["#36719F", "#144870"],
+        )
+        if completed:
+            log.info(f"Mina: secvență completă · {clicks} click-uri")
+            self._set_status("● Secvență completă — GATA", "#46d369")
+        else:
+            log.info("Mina: OFF")
+            self._show_ready()
+
+    def _toggle_mina(self) -> None:
+        if self._mina_active:
+            self._stop_mina()
+            return
+        self._mina_active = True
+        self._btn.configure(text="Stop", fg_color="#c44", hover_color="#a33")
+        self._set_status("● MINA activă — scanez piatra", "#5aa9e6")
+        log.info("Mina: ON — click automat pe piatră")
+        threading.Thread(target=self._mina_loop, daemon=True).start()
+
+    def _mina_loop(self) -> None:
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+
+        sct = mss.mss()
+        mon = sct.monitors[1]
+        clicks = 0
+        gate = mina.MinaClickGate()
+        completed = False
+        mina._get_scaled_templates()
+        log.info(f"Mina: captură {mon['width']}x{mon['height']}")
+
+        cap_on = self._mina_captures.get()
+        dbg_dir: Path | None = None
+        cap_idx = 0
+        last_cap_t = 0.0
+        last_cap_xy: tuple[int, int] | None = None
+        MINA_CAP_EVERY = 0.18
+        MINA_CAP_MOVE = 22
+
+        if cap_on:
+            from datetime import datetime
+
+            MINA_DEBUG_DIR.mkdir(exist_ok=True)
+            dbg_dir = MINA_DEBUG_DIR / f"sess_{datetime.now():%Y%m%d_%H%M%S}"
+            dbg_dir.mkdir(parents=True, exist_ok=True)
+            log.info(f"Mina: capturi detectare → {dbg_dir}")
+
+        def _save_cap(frame: np.ndarray, hit: dict | None, tag: str, caption: str = "") -> None:
+            nonlocal cap_idx, last_cap_t, last_cap_xy
+            if not cap_on or dbg_dir is None or cap_idx >= mina.MINA_DEBUG_MAX:
+                return
+            path = mina.save_detection_shot(frame, hit, dbg_dir, cap_idx, tag, caption=caption)
+            if path is not None:
+                cap_idx += 1
+                if hit:
+                    last_cap_xy = hit["center"]
+                last_cap_t = time.perf_counter()
+                log.debug(f"Mina cap: {path.name}")
+
+        def _maybe_save_detect(frame: np.ndarray, hit: dict, *, force: bool = False) -> None:
+            if not cap_on or dbg_dir is None:
+                return
+            cx, cy = hit["center"]
+            now_c = time.perf_counter()
+            moved = (
+                last_cap_xy is None
+                or (cx - last_cap_xy[0]) ** 2 + (cy - last_cap_xy[1]) ** 2 >= MINA_CAP_MOVE ** 2
+            )
+            if force or moved or (now_c - last_cap_t) >= MINA_CAP_EVERY:
+                method = hit.get("method", "?")
+                _save_cap(
+                    frame, hit, "detect",
+                    caption=f"{method} score={hit['score']:.2f} @ ({cx},{cy})",
+                )
+
+        try:
+            while self._mina_active and not gate.sequence_complete:
+                t0 = time.perf_counter()
+                shot = sct.grab(mon)
+                frame = cv2.cvtColor(np.asarray(shot), cv2.COLOR_BGRA2BGR)
+                match = mina.find_stone(
+                    frame,
+                    hint=gate.search_hint(),
+                    dead_zone=gate.dead_zone(),
+                )
+
+                clicked = False
+                if match and gate.is_valid_target(match):
+                    _maybe_save_detect(frame, match)
+
+                now_click = time.perf_counter()
+                if match and gate.should_click(match, now_click):
+                    cx, cy = match["center"]
+                    sx = mon["left"] + cx
+                    sy = mon["top"] + cy
+                    ok = game_input.click_at(sx, sy)
+                    stage = gate.on_click((cx, cy), now_click)
+                    clicks += 1
+                    clicked = True
+                    ms = (time.perf_counter() - t0) * 1000
+                    stone_n = min(
+                        gate.stones_done + (1 if gate.stage < mina.STAGES_PER_STONE else 0),
+                        mina.STONES_PER_SEQUENCE,
+                    )
+                    _save_cap(
+                        frame, match,
+                        f"click_p{stone_n}_c{stage}",
+                        caption=(
+                            f"CLICK piatra {stone_n}/{mina.STONES_PER_SEQUENCE} "
+                            f"· {stage}/{mina.STAGES_PER_STONE} · {match['score']:.2f}"
+                        ),
+                    )
+                    log.info(
+                        f"Mina: piatra {stone_n}/{mina.STONES_PER_SEQUENCE} "
+                        f"click {stage}/{mina.STAGES_PER_STONE} @ ({sx},{sy}) "
+                        f"score={match['score']:.2f} · {ms:.0f}ms"
+                        + ("" if ok else " — eșuat")
+                    )
+                    self._set_status(
+                        f"● Mina: piatra {stone_n}/{mina.STONES_PER_SEQUENCE} "
+                        f"· {stage}/{mina.STAGES_PER_STONE} · {ms:.0f}ms",
+                        "#6b6",
+                    )
+                    if gate.sequence_complete or clicks >= mina.CLICKS_PER_SEQUENCE:
+                        completed = True
+                        self._mina_active = False
+                        break
+                elif match is None:
+                    gate.should_click(None, now_click)
+                    time.sleep(MINA_SCAN_SEC)
+                elif not clicked:
+                    time.sleep(MINA_SCAN_SEC)
+        except Exception as exc:
+            log.error(f"Eroare Mina: {exc}", exc)
+            self._set_status(f"● Eroare: {exc}", "#c66")
+        finally:
+            try:
+                sct.close()
+            except Exception:
+                pass
+            self._running = False
+            self._mina_active = False
+            done = completed or gate.sequence_complete or clicks >= mina.CLICKS_PER_SEQUENCE
+            extra = f" · {cap_idx} capturi în {dbg_dir.name}" if cap_on and dbg_dir and cap_idx else ""
+            self.after(0, lambda d=done, c=clicks, e=extra: self._finish_mina_loop(d, c, e))
+
+    def _finish_mina_loop(self, completed: bool, clicks: int, extra: str = "") -> None:
+        """Cleanup UI pe main thread — o singură dată la ieșirea din buclă."""
+        self._stop_mina(completed=completed, clicks=clicks)
+        game_input.refocus_game()
+        if completed:
+            log.info(f"── Mina secvență completă · {clicks} click-uri{extra} ──")
+        else:
+            log.info(f"── Mina stop · {clicks} click-uri{extra} ──")
+
+    def _execute(self, from_hotkey: bool = False):
         with self._lock:
             if self._running:
                 return
             self._running = True
 
         self._set_status("● Scanez...", "#aaaaaa")
+
         def _prepare():
+            if from_hotkey:
+                return
             evt = threading.Event()
 
             def _minimize():
-                self.iconify()
-                evt.set()
+                try:
+                    if self.state() != "iconic" and self.winfo_viewable():
+                        self.iconify()
+                finally:
+                    evt.set()
 
             self.after(0, _minimize)
             evt.wait(timeout=0.5)
 
         try:
-            ok, msg = scan_and_press(
-                status_cb=lambda m: self._set_status(f"● {m}", "#6b6"),
-                key_delay_ms=self._key_delay_ms,
-                prepare_cb=_prepare,
-            )
-            self.after(0, self.deiconify)
+            ok, msg = False, ""
+            settle = HOTKEY_CAPTURE_SETTLE_MS if from_hotkey else 0
+            for attempt in range(3):
+                try:
+                    ok, msg = scan_and_press(
+                        status_cb=lambda m: self._set_status(f"● {m}", "#6b6"),
+                        key_delay_ms=self._key_delay_ms,
+                        prepare_cb=_prepare if not from_hotkey else None,
+                        settle_ms=settle if attempt == 0 else 0,
+                    )
+                    break
+                except Exception as exc:
+                    if attempt < 2 and _is_capture_error(exc):
+                        log.warn(f"Captură indisponibilă, reîncerc scan ({attempt + 2}/3)...")
+                        time.sleep(0.08)
+                        continue
+                    raise
             self._set_status(f"{'● OK:' if ok else '●'} {msg}", "#6b6" if ok else "#c88")
+            game_input.refocus_game()
         except Exception as exc:
             log.error(f"Eroare scan: {exc}", exc)
             self._set_status(f"● Eroare: {exc}", "#c66")
+            game_input.refocus_game()
         finally:
             self._running = False
 
     def _auto_loop(self):
         while self._auto:
             if not self._running:
-                self._execute()
+                self._execute(from_hotkey=True)
             time.sleep(SCAN_INTERVAL_SEC)
 
     def _on_close(self):
         self._auto = False
+        self._mina_active = False
         log.info("App închisă")
         _clear_pid()
         try:

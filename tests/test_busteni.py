@@ -110,6 +110,7 @@ def test_no_misfire_when_indicator_far_despite_bleed():
     s = busteni.BustenSession()
     s.start(0.0)
     s.cur_digit = "1"
+    s._digit_locked = True
     # mișcare rapidă spre zonă, dar indicatorul e încă la 90° distanță
     s.process(_synthetic(90, -20), 0.00)
     action = s.process(_synthetic(90, 0), 0.02)  # viteză mare, dar departe de zonă
@@ -129,6 +130,7 @@ def test_trigger_fires_when_indicator_on_zone():
     s = busteni.BustenSession()
     s.start(0.0)
     s.cur_digit = "5"  # sărim peste OCR în acest test sintetic
+    s._digit_locked = True
     s.process(_synthetic(90, 40), 0.0)  # citire curată a zonei (indicator departe)
     # indicatorul mătură prin zona de jos → trebuie să apese
     assert _sweep_until_press(s, 90, 48, 120, t0=0.04) == ("press", "5")
@@ -139,6 +141,7 @@ def test_no_trigger_when_indicator_far_from_zone():
     s = busteni.BustenSession()
     s.start(0.0)
     s.cur_digit = "5"
+    s._digit_locked = True
     assert s.process(frame, 0.0) is None
 
 
@@ -147,6 +150,7 @@ def test_moving_indicator_fires_near_zone_edge():
     s = busteni.BustenSession()
     s.start(0.0)
     s.cur_digit = "7"
+    s._digit_locked = True
     s.process(_synthetic(90, 50, half_deg=15), 0.0)  # citire curată a zonei
     assert _sweep_until_press(s, 90, 58, 110, step=4, t0=0.04) == ("press", "7")
 
@@ -156,6 +160,7 @@ def test_no_fire_far_below_zone():
     s = busteni.BustenSession()
     s.start(0.0)
     s.cur_digit = "7"
+    s._digit_locked = True
     assert s.process(_synthetic(90, 60, half_deg=15), 0.0) is None
 
 
@@ -163,14 +168,17 @@ def test_one_press_per_round_then_rearm_on_zone_jump():
     s = busteni.BustenSession()
     s.start(0.0)
     s.cur_digit = "3"
+    s._digit_locked = True
     s.process(_synthetic(90, 40), 0.0)  # citire curată zonă jos
     assert _sweep_until_press(s, 90, 48, 120, t0=0.04) == ("press", "3")
     # același loc → nu mai apasă (o singură apăsare per rundă)
     assert s.process(_synthetic(90, 90), 1.0) is None
     # rundă nouă: zona sare la 0°, indicator departe (fără teleport de viteză)
     s.cur_digit = None
+    s._digit_locked = False
     s.process(_synthetic(0, -52), 1.1)  # detectează saltul + citire curată
     s.cur_digit = "8"
+    s._digit_locked = True
     assert _sweep_until_press(s, 0, -44, 44, t0=1.2) == ("press", "8")
 
 
@@ -179,6 +187,7 @@ def test_second_round_fires_when_zone_lands_near_previous():
     s = busteni.BustenSession()
     s.start(0.0)
     s.cur_digit = "3"
+    s._digit_locked = True
     s.process(_synthetic(69, 0), 0.0)  # citire curată runda 1
     assert _sweep_until_press(s, 69, 12, 96, t0=0.04) == ("press", "3")
     # indicatorul continuă și PĂRĂSEȘTE zona → re-armare
@@ -186,7 +195,18 @@ def test_second_round_fires_when_zone_lands_near_previous():
     assert s.round_pressed is False
     # runda 2: zona la 60° (doar 9° față de 69) și cifră nouă
     s.cur_digit = "2"
+    s._digit_locked = True
     assert _sweep_until_press(s, 60, 0, 96, t0=0.6) == ("press", "2")
+
+
+def test_digit_lock_holds_against_later_reads():
+    """Citiri eronate după blocare NU schimbă cifra aleasă."""
+    s = busteni.BustenSession()
+    s.start(0.0)
+    s.cur_digit = "2"
+    s._digit_locked = True
+    s._votes = {"9": 20}
+    assert s.cur_digit == "2"
 
 
 def test_session_auto_stops():

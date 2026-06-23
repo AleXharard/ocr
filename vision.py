@@ -17,6 +17,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from app_paths import resource_path
+
 CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 ALLOWED = frozenset(CHARS)
 
@@ -24,7 +26,7 @@ ALLOWED = frozenset(CHARS)
 GLYPH_SIZE = 48           # latura imaginii normalizate a unei glife
 _MIN_SCORE = 0.45         # sub acest scor, o glifă e considerată "nesigură"
 _FALLBACK_FRAC = 0.30     # dacă >30% din glife sunt nesigure → încearcă RapidOCR
-BANK_PATH = Path(__file__).resolve().parent / "glyph_bank.npz"
+BANK_PATH = resource_path("glyph_bank.npz")
 
 _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
 _bank: "GlyphBank | None" = None

@@ -3,8 +3,23 @@ __pycache__/
 .keyauto.pid
 logs/
 debug_busteni/
+debug_mina/
 regions.json
+busteni_region.json
+selected_region.json
+hotkey.json
 .cursor/
 _analyze*.py
 _head_ocr.py
 *.log
+
+# Build PyInstaller
+build/
+dist/
+
+# Portable git local (nu pe GitHub)
+_tools/mingit/
+_tools/mingit.zip
+
+# pip accident
+6.0

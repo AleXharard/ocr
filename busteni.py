@@ -42,7 +42,11 @@ MAX_LEAD_RAD = math.radians(10) # plafon al predicției ca să nu „sară" pest
 TRIGGER_HALF = math.radians(12) # apăsăm când indicatorul e aproape de CENTRUL zonei (nu la margine)
 MAX_ZONE_HALF = math.radians(55)  # o zonă reală nu depășește ~110° → restul e zgomot
 DIGITS = "123456789"
-MIN_DIGIT_SCORE = 0.25          # sub atât, citirea cifrei e nesigură → nu apăsăm
+MIN_DIGIT_SCORE = 0.28          # sub atât, citirea cifrei e nesigură → nu apăsăm
+MIN_VOTE_SCORE = 0.30           # prag pentru un vot în consens
+LOCK_SCORE = 0.38               # o singură citire foarte sigură → îngheță cifra
+LOCK_VOTES = 3                  # consens din cadre curate (indicator departe de zonă)
+DIGIT_CLEAR_DEG = 30.0          # indicatorul e „departe" de zonă → cifra centrală e curată
 
 
 # ── Segmentare culoare ───────────────────────────────────────────────────────
@@ -149,8 +153,8 @@ def read_digit(frame_bgr: np.ndarray, teal_mask: np.ndarray | None = None) -> tu
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     if teal_mask is not None:
         sub = teal_mask[max(0, cy - rh): cy + rh, max(0, cx - rw): cx + rw].astype(np.uint8)
-        # dilatăm masca teal ca să acoperim și halo-ul anti-aliased al indicatorului
-        sub = cv2.dilate(sub, np.ones((5, 5), np.uint8))
+        # dilatare mică — una prea mare poate mânca pixeli ai cifrei albe
+        sub = cv2.dilate(sub, np.ones((3, 3), np.uint8))
         gray[sub > 0] = 0  # scoatem teal din ROI ca să nu fie confundat cu cerneala
 
     # Cifra e ALBĂ pe fundal închis — invers față de jocul cu casete (negru pe alb).
@@ -191,6 +195,7 @@ class BustenSession:
         self.ind_hist: list[tuple[float, float]] = []
         self.pressed_count = 0
         self._votes: dict[str, int] = {}  # voturi cifră în runda curentă (cifra e fixă/rundă)
+        self._digit_locked = False       # odată înghețată, cifra NU se schimbă până la rundă nouă
         self.last_state: dict = {"has_teal": False}
 
     def start(self, now: float) -> None:
@@ -219,6 +224,35 @@ class BustenSession:
         dt = t1 - t0
         return ang_diff(a1, a0) / dt if dt > 1e-4 else 0.0
 
+    def _clean_for_digit(self, ia: float | None, zc: float | None, zh: float | None) -> bool:
+        """Cifra centrală e citibilă când indicatorul nu e peste zona țintă."""
+        if ia is None or zc is None or zh is None:
+            return True
+        return abs(ang_diff(ia, zc)) > zh + math.radians(DIGIT_CLEAR_DEG)
+
+    def _read_and_lock_digit(
+        self, frame_bgr: np.ndarray, teal_mask: np.ndarray, ia: float | None,
+        zc: float | None, zh: float | None,
+    ) -> None:
+        """Citește cifra doar din cadre curate; o îngheță după consens — nu o suprascrie."""
+        if self._digit_locked or self.round_pressed:
+            return
+        if not self._clean_for_digit(ia, zc, zh):
+            return
+        d_raw, d_score = read_digit(frame_bgr, teal_mask)
+        if d_raw is None:
+            return
+        if d_score >= LOCK_SCORE:
+            self.cur_digit = d_raw
+            self._digit_locked = True
+            return
+        if d_score >= MIN_VOTE_SCORE:
+            self._votes[d_raw] = self._votes.get(d_raw, 0) + 1
+            best = max(self._votes, key=self._votes.get)
+            if self._votes[best] >= LOCK_VOTES:
+                self.cur_digit = best
+                self._digit_locked = True
+
     def process(self, frame_bgr: np.ndarray, now: float) -> tuple[str, str] | None:
         """Întoarce ('press', cifra) când trebuie apăsat, altfel None."""
         st = detect_state(frame_bgr)
@@ -229,12 +263,11 @@ class BustenSession:
         self.seen = True
         self.last_teal_t = now
         zc_now, zh_now, ia = st["zone_center"], st["zone_half"], st["ind_angle"]
+        teal_mask = st["zone_mask"] | st["ind_mask"]
 
-        # Citim cifra în FIECARE cadru și VOTĂM (cifra e constantă pe rundă) — astfel
-        # o citire eronată izolată nu strică alegerea. cur_digit = cifra cea mai votată.
-        d_raw, _ = read_digit(frame_bgr, st["zone_mask"] | st["ind_mask"])
-        if d_raw is not None:
-            self._votes[d_raw] = self._votes.get(d_raw, 0) + 1
+        # Cifra e constantă pe rundă — o citim doar din cadre curate și o ÎNGHEȚĂM.
+        # Citiri eronate când indicatorul trece prin zonă NU mai pot schimba alegerea.
+        self._read_and_lock_digit(frame_bgr, teal_mask, ia, zc_now, zh_now)
         majority = max(self._votes, key=self._votes.get) if self._votes else None
 
         # Rundă nouă după o apăsare. Trei semnale (oricare e suficient):
@@ -254,11 +287,9 @@ class BustenSession:
                 self.ind_hist.clear()
                 self.zone_center = self.zone_half = None
                 self._votes = {}
+                self._digit_locked = False
 
-        # cifra curentă a rundei (până apăsăm) = cea mai votată citire
-        if not self.round_pressed and majority is not None:
-            self.cur_digit = majority
-
+        # cifra curentă rămâne cea înghețată; nu o suprascriem cu voturi noi
         # Cachuim zona din cadre „curate" (indicatorul departe de ea). Când indicatorul
         # o atinge, el ocluzează arcul și deformează măsurarea → folosim valoarea cachuită.
         if zc_now is not None and zh_now is not None:
@@ -271,8 +302,8 @@ class BustenSession:
             self.ind_hist = self.ind_hist[-5:]
 
         zc, zh = self.zone_center, self.zone_half
-        if (not self.round_pressed and self.cur_digit and ia is not None
-                and zc is not None and zh is not None):
+        if (not self.round_pressed and self._digit_locked and self.cur_digit
+                and ia is not None and zc is not None and zh is not None):
             lead = self._velocity() * LEAD_SEC
             lead = max(-MAX_LEAD_RAD, min(MAX_LEAD_RAD, lead))  # nu sărim peste zonă
             pred = ia + lead

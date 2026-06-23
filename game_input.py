@@ -1,4 +1,4 @@
-"""Trimitere taste către FiveM/GTA — focus fereastră, fără mouse."""
+"""Trimitere taste și click mouse către FiveM/GTA — focus fereastră."""
 
 from __future__ import annotations
 
@@ -159,6 +159,15 @@ def focus_game(minimize_cb=None, fast: bool = False) -> bool:
     return False
 
 
+def refocus_game() -> bool:
+    """Readuce focusul pe joc după scan, fără a ridica fereastra Key Auto."""
+    hwnd = get_target_hwnd()
+    if not hwnd:
+        return False
+    _force_foreground(hwnd)
+    return user32.GetForegroundWindow() == hwnd
+
+
 def _char_to_vk(ch: str) -> tuple[int, bool] | None:
     result = user32.VkKeyScanW(ord(ch))
     if result == -1:
@@ -259,3 +268,47 @@ def press_key(ch: str) -> bool:
         return True
 
     return False
+
+
+def move_to(x: int, y: int) -> bool:
+    """Mută mouse-ul fără click."""
+    x, y = int(x), int(y)
+    if _use_pydirectinput:
+        try:
+            import pydirectinput
+
+            pydirectinput.moveTo(x, y)
+            return True
+        except Exception as e:
+            log.debug(f"pydirectinput move eșuat: {e}")
+
+    try:
+        user32.SetCursorPos(x, y)
+        return True
+    except Exception as e:
+        log.debug(f"SetCursorPos eșuat @ ({x},{y}): {e}")
+        return False
+
+
+def click_at(x: int, y: int) -> bool:
+    """Mută mouse-ul la (x, y) pe ecran și dă click stânga."""
+    move_to(x, y)
+    x, y = int(x), int(y)
+    if _use_pydirectinput:
+        try:
+            import pydirectinput
+
+            pydirectinput.click(x, y)
+            return True
+        except Exception as e:
+            log.debug(f"pydirectinput click eșuat: {e}")
+
+    try:
+        MOUSEEVENTF_LEFTDOWN = 0x0002
+        MOUSEEVENTF_LEFTUP = 0x0004
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        return True
+    except Exception as e:
+        log.warn(f"Click mouse eșuat @ ({x},{y}): {e}")
+        return False

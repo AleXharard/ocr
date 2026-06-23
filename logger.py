@@ -9,7 +9,9 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-LOG_DIR = Path(__file__).resolve().parent / "logs"
+from app_paths import app_dir
+
+LOG_DIR = app_dir() / "logs"
 _MAX_LOG_FILES = 10  # păstrăm doar ultimele N loguri de sesiune; restul se șterg
 
 _ui_sink: "LogPanel | None" = None

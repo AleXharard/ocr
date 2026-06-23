@@ -1,11 +1,10 @@
 @echo off
 setlocal EnableExtensions
-title Key Auto OCR - Launcher
+title Key Auto
 
 cd /d "%~dp0"
 
-:: ── 1. Self-elevate to administrator ───────────────────────────────────────
-:: Sending keys into a game (pydirectinput / keyboard) needs admin rights.
+:: ── 1. Self-elevate (tastele in joc necesita admin) ───────────────────────
 net session >nul 2>&1
 if %errorLevel% neq 0 (
     echo Cer drepturi de administrator...
@@ -15,40 +14,32 @@ if %errorLevel% neq 0 (
 
 cd /d "%~dp0"
 
-:: ── 2. Pick the available Python command ───────────────────────────────────
-where py >nul 2>&1 && (set "PY=py -3") || (set "PY=python")
+:: ── 2. EXE unic (fara consola) ────────────────────────────────────────────
+if exist "dist\KeyAuto.exe" (
+    start "" "%~dp0dist\KeyAuto.exe"
+    exit /b 0
+)
 
+:: compat: build vechi cu folder
+if exist "dist\KeyAuto\KeyAuto.exe" (
+    start "" /D "%~dp0dist\KeyAuto" "%~dp0dist\KeyAuto\KeyAuto.exe"
+    exit /b 0
+)
+
+:: ── 3. Fallback: sursa Python ─────────────────────────────────────────────
+where py >nul 2>&1 && (set "PY=py -3") || (set "PY=python")
 %PY% --version >nul 2>&1
 if errorlevel 1 (
-    echo.
-    echo [EROARE] Python nu a fost gasit. Instaleaza Python 3 si reincearca.
-    echo.
+    echo Python negasit. Ruleaza BUILD.bat pentru dist\KeyAuto.exe
     pause
     exit /b 1
 )
 
-:: ── 3. Ensure dependencies are installed (fast import check) ────────────────
 %PY% -c "import customtkinter, cv2, mss, numpy, dxcam, rapidocr_onnxruntime, pydirectinput, keyboard, PIL" >nul 2>&1
 if errorlevel 1 (
-    echo.
-    echo Instalez dependintele... ^(o singura data^)
-    echo.
+    echo Instalez dependintele...
     %PY% -m pip install -r requirements.txt
-    if errorlevel 1 (
-        echo.
-        echo [EROARE] Instalarea dependintelor a esuat. Vezi mesajele de mai sus.
-        echo.
-        pause
-        exit /b 1
-    )
 )
 
-:: ── 4. Launch the app ──────────────────────────────────────────────────────
-echo.
-echo Pornesc Key Auto OCR...
-echo.
-%PY% main.py
-
-echo.
-echo Aplicatia s-a inchis.
-pause
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0restart.ps1" -Background
+exit /b 0
